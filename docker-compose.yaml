@@ -1,0 +1,10 @@
+version: '3'
+services:
+  flask_app:
+    build: .
+    container_name: pythonmailservice
+    restart: unless-stopped
+    ports:
+      - '8004:8004'
+    volumes:
+      - ./data:/usr/src/app/data
