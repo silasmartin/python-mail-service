@@ -45,10 +45,13 @@ def send_email():
     email = data.get("email")
     message = data.get("message")
 
+    mailmessage = f"Hallo :) Dein Kontaktformular hat soeben eine neue Nachricht an dich abgeschickt:\n\nNam: {data.get("name")}\nMail: {data.get("email")}\nNachricht: {data.get("message")}\n\nEine Antwort auf diese Bee
+nachrichtungsmail wird als Antwort an den Absender der Anfrage geschikt.\n\nHab einen super Tag!"
+
     msg = Message(
         subject=f"Message from {name}",
         recipients=recipients,
-        body=message,
+        body=mailmessage,
         reply_to=email,
     )
 
