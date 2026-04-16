@@ -4,6 +4,7 @@ from flask_cors import CORS
 import os
 from dotenv import load_dotenv
 import threading
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -37,6 +38,15 @@ def get_recipients_from_domain(referer):
 def send_email_in_background(msg):
     with app.app_context():
         mail.send(msg)
+
+
+def send_telegram_notification(text):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
 
 
 @app.route("/submit", methods=["POST"])
@@ -75,8 +85,9 @@ def submit():
     with open(data_file_path, "a") as file:
         file.write(f"Name: {name}\nEmail: {email}\nMessage: {message}\n\n")
 
-    # Send email in the background
+    # Send email and Telegram notification in the background
     threading.Thread(target=send_email_in_background, args=(msg,)).start()
+    threading.Thread(target=send_telegram_notification, args=(mailmessage,)).start()
 
     return jsonify({"message": "Message received successfully!"}), 200
 
