@@ -32,9 +32,11 @@ ships a `/health` endpoint used by the Docker healthcheck.
 
 ## API
 
-- `POST /submit` — JSON body `{ "name", "email", "message" }`. The request
-  `Referer` must match a configured domain. Returns `200` on success, `400` for
-  invalid input, `403` for an unauthorized domain.
+- `POST /submit` — JSON body with arbitrary form fields; every field is included
+  in the notification email. `email` (if present) is used as Reply-To and `name`
+  in the subject. The request `Referer` must match a configured domain. Returns
+  `200` on success, `400` for invalid input, `403` for an unauthorized domain.
+  See [docs/SUBMITTING.md](docs/SUBMITTING.md) for the full contract.
 - `GET /health` — liveness probe, returns `{"status": "ok"}`.
 
 ## Local development

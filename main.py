@@ -23,10 +23,12 @@ logger = logging.getLogger("mail-service")
 
 REQUIRED_ENV = ["MAIL_SERVER", "MAIL_USERNAME", "MAIL_PASSWORD", "MAIL_DEFAULT_SENDER"]
 
-# Maximum accepted length for each form field (defense against abuse).
-MAX_NAME_LEN = 200
+# Limits on the submitted form (defense against abuse). The form is variable:
+# any set of fields is accepted, within these bounds.
+MAX_FIELDS = 50
+MAX_KEY_LEN = 100
+MAX_VALUE_LEN = 10000
 MAX_EMAIL_LEN = 320
-MAX_MESSAGE_LEN = 10000
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -120,33 +122,58 @@ def send_telegram_notification(text):
         logger.exception("Failed to send Telegram notification")
 
 
-def _persist_submission(data_dir, name, email, message):
+def _persist_submission(data_dir, fields):
     try:
         os.makedirs(data_dir, exist_ok=True)
         path = os.path.join(data_dir, "form_data.txt")
         with open(path, "a", encoding="utf-8") as fh:
-            fh.write(f"Name: {name}\nEmail: {email}\nMessage: {message}\n\n")
+            fh.write("".join(f"{key}: {value}\n" for key, value in fields.items()))
+            fh.write("\n")
     except OSError:
         logger.exception("Failed to persist submission to %s", data_dir)
 
 
 def _validate_payload(data):
-    """Return (fields, error). fields is a dict on success, error is a message on failure."""
+    """Validate a variable form submission.
+
+    Accepts any JSON object of field -> scalar value. Returns (fields, error)
+    where fields is an ordered dict of trimmed string values on success, or
+    error is a human-readable message on failure.
+    """
     if not isinstance(data, dict):
         return None, "Request body must be a JSON object"
+    if not data:
+        return None, "Request body must contain at least one field"
+    if len(data) > MAX_FIELDS:
+        return None, f"Too many fields (max {MAX_FIELDS})"
 
-    name = (data.get("name") or "").strip()
-    email = (data.get("email") or "").strip()
-    message = (data.get("message") or "").strip()
+    fields = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not key.strip():
+            return None, "Field names must be non-empty strings"
+        if len(key) > MAX_KEY_LEN:
+            return None, "A field name exceeds the maximum allowed length"
+        if value is None:
+            text = ""
+        elif isinstance(value, bool):
+            text = "true" if value else "false"
+        elif isinstance(value, (str, int, float)):
+            text = str(value).strip()
+        else:
+            return None, f"Field '{key.strip()}' must be a string, number or boolean"
+        if len(text) > MAX_VALUE_LEN:
+            return None, f"Field '{key.strip()}' exceeds the maximum allowed length"
+        fields[key.strip()] = text
 
-    if not name or not email or not message:
-        return None, "Fields 'name', 'email' and 'message' are required"
-    if len(name) > MAX_NAME_LEN or len(email) > MAX_EMAIL_LEN or len(message) > MAX_MESSAGE_LEN:
-        return None, "One or more fields exceed the maximum allowed length"
-    if not EMAIL_RE.match(email):
+    if not any(fields.values()):
+        return None, "At least one field must have a value"
+
+    # 'email', if supplied, is used as the reply-to address, so validate it.
+    email = fields.get("email")
+    if email and (len(email) > MAX_EMAIL_LEN or not EMAIL_RE.match(email)):
         return None, "Invalid email address"
 
-    return {"name": name, "email": email, "message": message}, None
+    return fields, None
 
 
 # --- Routes ------------------------------------------------------------------
@@ -170,25 +197,34 @@ def register_routes(app, mail):
         if error:
             return jsonify({"error": error}), 400
 
-        name, email, message = fields["name"], fields["email"], fields["message"]
+        # 'name' and 'email' get special treatment when present; every other
+        # field is rendered into the body as submitted.
+        name = fields.get("name")
+        email = fields.get("email")
 
+        field_lines = "\n".join(
+            f"{key}: {value}" for key, value in fields.items() if value
+        )
+        reply_note = (
+            "Eine Antwort auf diese Benachrichtigung wird als Antwort an den Absender der Anfrage geschickt.\n\n"
+            if email
+            else ""
+        )
         mailmessage = (
             "Hallo :) Dein Kontaktformular hat soeben eine neue Nachricht an dich abgeschickt:\n\n"
-            f"Name: {name}\n"
-            f"Mail: {email}\n"
-            f"Nachricht: {message}\n\n"
-            "Eine Antwort auf diese Benachrichtigung wird als Antwort an den Absender der Anfrage geschickt.\n\n"
+            f"{field_lines}\n\n"
+            f"{reply_note}"
             "Hab einen super Tag!"
         )
 
         msg = Message(
-            subject=f"Message from {name}",
+            subject=f"Message from {name}" if name else "Neue Nachricht über dein Kontaktformular",
             recipients=recipients,
             body=mailmessage,
-            reply_to=email,
+            reply_to=email or None,
         )
 
-        _persist_submission(app.config["DATA_DIR"], name, email, message)
+        _persist_submission(app.config["DATA_DIR"], fields)
 
         threading.Thread(
             target=send_email_in_background, args=(app, mail, msg), daemon=True
