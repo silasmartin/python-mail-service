@@ -1,5 +1,16 @@
-bin
-include
-lib
+# Virtualenv
+bin/
+include/
+lib/
 pyvenv.cfg
+
+# Secrets
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Runtime data (form submissions)
+data/*
+!data/.gitkeep

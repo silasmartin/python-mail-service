@@ -1,10 +1,28 @@
-version: '3'
 services:
   flask_app:
     build: .
+    image: pythonmailservice
     container_name: pythonmailservice
     restart: unless-stopped
+    env_file:
+      - .env
     ports:
       - '8004:8004'
     volumes:
       - ./data:/usr/src/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8004/health', timeout=3).status==200 else sys.exit(1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
