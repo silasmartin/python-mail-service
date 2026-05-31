@@ -7,7 +7,7 @@ services:
     env_file:
       - .env
     ports:
-      - '8004:8004'
+      - '127.0.0.1:8004:8004'
     volumes:
       - ./data:/usr/src/app/data
     healthcheck:
