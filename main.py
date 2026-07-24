@@ -1,14 +1,18 @@
-import json
 import logging
 import os
 import re
 import threading
+import uuid
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
-import requests
+from captcha import verify_and_consume_captcha
+from config import load_domain_config
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_mail import Mail, Message
+from mailer import send_email
+from notify import send_ops_alert
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 load_dotenv()
@@ -21,8 +25,6 @@ logger = logging.getLogger("mail-service")
 
 # --- Configuration -----------------------------------------------------------
 
-REQUIRED_ENV = ["MAIL_SERVER", "MAIL_USERNAME", "MAIL_PASSWORD", "MAIL_DEFAULT_SENDER"]
-
 # Limits on the submitted form (defense against abuse). The form is variable:
 # any set of fields is accepted, within these bounds.
 MAX_FIELDS = 50
@@ -32,23 +34,10 @@ MAX_EMAIL_LEN = 320
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-
-def _load_domain_email_map():
-    """Load the domain -> [recipients] map from the DOMAIN_EMAIL_MAP env var (JSON)."""
-    raw = os.getenv("DOMAIN_EMAIL_MAP")
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"DOMAIN_EMAIL_MAP is not valid JSON: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise RuntimeError("DOMAIN_EMAIL_MAP must be a JSON object of domain -> [emails]")
-    # Normalise values to lists.
-    return {
-        domain: ([emails] if isinstance(emails, str) else list(emails))
-        for domain, emails in parsed.items()
-    }
+# 'name' and 'email' carry meaning for the service, so their keys are fixed and
+# lowercase. Every other field is rendered under the label the form submitted,
+# so only these two need a presentable form in the email body.
+DISPLAY_LABELS = {"name": "Name", "email": "Email"}
 
 
 def create_app():
@@ -58,22 +47,11 @@ def create_app():
     # the client IP and scheme are reported correctly.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-    missing = [name for name in REQUIRED_ENV if not os.getenv(name)]
-    if missing:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
-
-    app.config["MAIL_SERVER"] = os.getenv("MAIL_SERVER")
-    app.config["MAIL_PORT"] = int(os.getenv("MAIL_PORT", "587"))
-    app.config["MAIL_USE_TLS"] = os.getenv("MAIL_USE_TLS", "true").lower() == "true"
-    app.config["MAIL_USE_SSL"] = os.getenv("MAIL_USE_SSL", "false").lower() == "true"
-    app.config["MAIL_USERNAME"] = os.getenv("MAIL_USERNAME")
-    app.config["MAIL_PASSWORD"] = os.getenv("MAIL_PASSWORD")
-    app.config["MAIL_DEFAULT_SENDER"] = os.getenv("MAIL_DEFAULT_SENDER")
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024  # 64 KiB request body cap
 
-    app.config["DOMAIN_EMAIL_MAP"] = _load_domain_email_map()
-    if not app.config["DOMAIN_EMAIL_MAP"]:
-        logger.warning("DOMAIN_EMAIL_MAP is empty; all /submit requests will be rejected")
+    app.config["DOMAIN_CONFIG"] = load_domain_config()
+    if not app.config["DOMAIN_CONFIG"]:
+        logger.warning("DOMAIN_CONFIG is empty; all /submit requests will be rejected")
 
     app.config["DATA_DIR"] = os.getenv("DATA_DIR", "/usr/src/app/data")
 
@@ -81,56 +59,71 @@ def create_app():
     origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
     CORS(app, resources={r"/submit": {"origins": origins or []}})
 
-    mail = Mail(app)
-    register_routes(app, mail)
+    register_routes(app)
     return app
 
 
 # --- Helpers -----------------------------------------------------------------
 
 
-def get_recipients_from_domain(domain_map, referer):
-    if not referer:
+def get_domain_settings(domain_config, origin, referer):
+    source = origin or referer
+    if not source:
         return None
-    for domain, recipients in domain_map.items():
-        if domain in referer:
-            return recipients
-    return None
+    try:
+        hostname = urlsplit(source).hostname
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    return domain_config.get(hostname.lower().rstrip("."))
 
 
-def send_email_in_background(app, mail, msg):
-    with app.app_context():
-        try:
-            mail.send(msg)
-            logger.info("Notification email sent to %s", msg.recipients)
-        except Exception:  # noqa: BLE001 - log and swallow; this runs detached
-            logger.exception("Failed to send notification email")
+def send_email_in_background(smtp, recipients, subject, body, reply_to, data_dir, domain):
+    """Deliver the notification email, buffering the inquiry if delivery fails.
 
-
-def send_telegram_notification(text):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
+    Submissions are never written to disk on the happy path - the mailbox is
+    the system of record. Only a failed delivery is buffered, so that an
+    inquiry is not silently lost, and the operator is alerted to recover it.
+    """
+    try:
+        send_email(smtp, recipients, subject, body, reply_to)
+        logger.info("Notification email sent to %s", recipients)
         return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        resp = requests.post(
-            url, json={"chat_id": chat_id, "text": text}, timeout=10
+    except Exception as error:  # noqa: BLE001 - log and swallow; this runs detached
+        logger.exception("Failed to send notification email")
+        # `error` is unbound once the except block ends, so keep what is needed.
+        error_type = type(error).__name__
+
+    reference = _buffer_failed_submission(data_dir, subject, body, recipients)
+
+    # Operational facts only: the exception message and the recipients may
+    # contain personal data, the exception type does not.
+    send_ops_alert(
+        "Mail delivery failed.\n"
+        f"Domain: {domain}\n"
+        f"Error: {error_type}\n"
+        + (
+            f"The inquiry was buffered as {reference} and can be recovered."
+            if reference
+            else "The inquiry could NOT be buffered and is lost."
         )
-        resp.raise_for_status()
-    except requests.RequestException:
-        logger.exception("Failed to send Telegram notification")
+    )
 
 
-def _persist_submission(data_dir, fields):
+def _buffer_failed_submission(data_dir, subject, body, recipients):
+    """Write an undeliverable submission to disk; return its filename or None."""
+    directory = os.path.join(data_dir, "failed")
+    name = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}.txt"
     try:
-        os.makedirs(data_dir, exist_ok=True)
-        path = os.path.join(data_dir, "form_data.txt")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write("".join(f"{key}: {value}\n" for key, value in fields.items()))
-            fh.write("\n")
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, name), "w", encoding="utf-8") as fh:
+            fh.write(f"To: {', '.join(recipients)}\nSubject: {subject}\n\n{body}")
     except OSError:
-        logger.exception("Failed to persist submission to %s", data_dir)
+        logger.exception("Failed to buffer undeliverable submission in %s", directory)
+        return None
+    logger.warning("Buffered undeliverable submission as %s", name)
+    return name
 
 
 def _validate_payload(data):
@@ -179,17 +172,19 @@ def _validate_payload(data):
 # --- Routes ------------------------------------------------------------------
 
 
-def register_routes(app, mail):
+def register_routes(app):
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok"}), 200
 
     @app.route("/submit", methods=["POST"])
     def submit():
-        recipients = get_recipients_from_domain(
-            app.config["DOMAIN_EMAIL_MAP"], request.headers.get("Referer")
+        domain_settings = get_domain_settings(
+            app.config["DOMAIN_CONFIG"],
+            request.headers.get("Origin"),
+            request.headers.get("Referer"),
         )
-        if recipients is None:
+        if domain_settings is None:
             return jsonify({"error": "Unauthorized domain"}), 403
 
         data = request.get_json(silent=True)
@@ -197,13 +192,30 @@ def register_routes(app, mail):
         if error:
             return jsonify({"error": error}), 400
 
+        # Silently accept honeypot submissions so bots do not learn why their
+        # request was discarded.
+        if fields.pop("website", ""):
+            return jsonify({"message": "Message received successfully!"}), 200
+
+        captcha_answer = fields.pop("captchaAnswer", "")
+        captcha_token = fields.pop("captchaToken", "")
+        if not verify_and_consume_captcha(
+            captcha_token,
+            captcha_answer,
+            domain_settings.captcha_secret,
+            app.config["DATA_DIR"],
+        ):
+            return jsonify({"error": "Invalid or expired CAPTCHA"}), 422
+
         # 'name' and 'email' get special treatment when present; every other
         # field is rendered into the body as submitted.
         name = fields.get("name")
         email = fields.get("email")
 
         field_lines = "\n".join(
-            f"{key}: {value}" for key, value in fields.items() if value
+            f"{DISPLAY_LABELS.get(key, key)}: {value}"
+            for key, value in fields.items()
+            if value
         )
         reply_note = (
             "Eine Antwort auf diese Benachrichtigung wird als Antwort an den Absender der Anfrage geschickt.\n\n"
@@ -211,26 +223,29 @@ def register_routes(app, mail):
             else ""
         )
         mailmessage = (
-            "Hallo :) Dein Kontaktformular hat soeben eine neue Nachricht an dich abgeschickt:\n\n"
+            "Neue Anfrage über das Kontaktformular:\n\n"
             f"{field_lines}\n\n"
             f"{reply_note}"
-            "Hab einen super Tag!"
         )
 
-        msg = Message(
-            subject=f"Message from {name}" if name else "Neue Nachricht über dein Kontaktformular",
-            recipients=recipients,
-            body=mailmessage,
-            reply_to=email or None,
+        subject = (
+            f"Message from {name}"
+            if name
+            else "Neue Nachricht über dein Kontaktformular"
         )
 
-        _persist_submission(app.config["DATA_DIR"], fields)
-
         threading.Thread(
-            target=send_email_in_background, args=(app, mail, msg), daemon=True
-        ).start()
-        threading.Thread(
-            target=send_telegram_notification, args=(mailmessage,), daemon=True
+            target=send_email_in_background,
+            args=(
+                domain_settings.smtp,
+                domain_settings.recipients,
+                subject,
+                mailmessage,
+                email or None,
+                app.config["DATA_DIR"],
+                domain_settings.domain,
+            ),
+            daemon=True,
         ).start()
 
         return jsonify({"message": "Message received successfully!"}), 200

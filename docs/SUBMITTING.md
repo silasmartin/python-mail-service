@@ -1,8 +1,8 @@
 # Integration Guide: Submitting to the Mail Service
 
 Instructions for an agent (or developer) wiring a contact form up to this
-service. Follow these exactly — the two things that trip up integrations are the
-`Referer`-based domain check and the CORS allow-list.
+service. Follow these exactly — the common integration issues are domain
+matching, CAPTCHA secrets, and the CORS allow-list.
 
 ## Endpoint
 
@@ -29,7 +29,9 @@ names are mandatory:
   "email": "alice@example.com",
   "company": "Acme Inc.",
   "budget": 5000,
-  "message": "Hello, I'd like to get in touch."
+  "message": "Hello, I'd like to get in touch.",
+  "captchaAnswer": "12",
+  "captchaToken": "signed-token-from-the-challenge-endpoint"
 }
 ```
 
@@ -40,8 +42,26 @@ Two field names get special handling **when present** (both optional):
 - `name` — used in the email subject (`Message from <name>`). Falls back to a
   generic subject when absent.
 
+Both are rendered in the body as `Name:` / `Email:`; every other field keeps the
+exact label you submitted it under.
+
+One further field name is reserved:
+
+- `website` — a honeypot. Render a hidden, non-focusable input under this name
+  and leave it empty. Submissions where it is non-empty are discarded silently
+  and still answered with `200`, so bots learn nothing.
+
 Values must be scalars — strings, numbers, or booleans. Nested objects/arrays
 are rejected.
+
+`captchaAnswer` and `captchaToken` are required. They are validated and removed
+before the notification is persisted or sent. The token is encrypted and
+authenticated with the submitting domain's `captcha_secret` and expires after
+ten minutes.
+
+**A token is worth exactly one attempt.** It is consumed whether or not the
+answer is correct, so a `422` means the client must fetch a *new* challenge —
+resubmitting the same token, even with the right answer, will fail again.
 
 Constraints (enforced server-side — violating them returns `400`):
 
@@ -53,12 +73,12 @@ Constraints (enforced server-side — violating them returns `400`):
 | `email`, if present, must match `local@domain.tld` and be ≤ 320   |
 | total request body ≤ 64 KiB                                       |
 
-## Authorization: the `Referer` header
+## Authorization: submitting hostname
 
-There is no API key. Authorization is by domain: the request's `Referer` header
-must **contain** one of the domains configured in the service's
-`DOMAIN_EMAIL_MAP` env var. That matched domain determines who receives the
-email.
+There is no API key. Authorization is by exact hostname. The service uses the
+request's `Origin` header when present and otherwise falls back to `Referer`.
+That hostname must be a key in `DOMAIN_CONFIG`; the matched entry determines
+the recipients, CAPTCHA secret, and SMTP credentials.
 
 - **From a browser** (`fetch`/`XMLHttpRequest`): the browser sets `Referer`
   automatically to the page URL, so as long as the form is served from a
@@ -67,8 +87,8 @@ email.
 - **From a server / script / agent**: there is no browser, so you must set the
   `Referer` header yourself to a URL on a configured domain.
 
-If `Referer` is missing or matches no configured domain, the service returns
-`403 {"error": "Unauthorized domain"}`.
+If both headers are missing or the selected header matches no configured
+domain, the service returns `403 {"error": "Unauthorized domain"}`.
 
 ## CORS (browser submissions only)
 
@@ -81,14 +101,16 @@ callers ignore CORS entirely.
 
 | Status | Meaning                                   | Body                                          |
 |--------|-------------------------------------------|-----------------------------------------------|
-| `200`  | Accepted (email/Telegram sent async)      | `{"message": "Message received successfully!"}` |
+| `200`  | Accepted (email sent async)               | `{"message": "Message received successfully!"}` |
 | `400`  | Invalid/missing fields or bad email       | `{"error": "<reason>"}`                       |
-| `403`  | `Referer` not an authorized domain        | `{"error": "Unauthorized domain"}`            |
+| `403`  | Origin/referer hostname is unauthorized    | `{"error": "Unauthorized domain"}`            |
+| `422`  | CAPTCHA invalid, expired, or already used  | `{"error": "Invalid or expired CAPTCHA"}`     |
 | `413`  | Request body exceeded 64 KiB              | `{"error": "Payload too large"}`              |
 
-A `200` means the submission was accepted and queued — the email and optional
-Telegram notification are sent on background threads, so delivery failures are
-logged server-side but are **not** reflected in the HTTP response.
+A `200` means the submission was accepted and queued — the email is sent on a
+background thread, so delivery failures are **not** reflected in the HTTP
+response. They are logged, the inquiry is buffered on the server so it can be
+recovered, and the operator is alerted.
 
 ## Examples
 
@@ -98,7 +120,7 @@ logged server-side but are **not** reflected in the HTTP response.
 const res = await fetch("https://yourdomain.com/api/submit", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ name, email, message }),
+  body: JSON.stringify({ name, email, message, captchaAnswer, captchaToken }),
 });
 if (!res.ok) {
   const { error } = await res.json();
@@ -112,7 +134,7 @@ if (!res.ok) {
 curl -fsS https://yourdomain.com/api/submit \
   -H "Content-Type: application/json" \
   -H "Referer: https://yourdomain.com/contact" \
-  -d '{"name":"Alice","email":"alice@example.com","message":"Hello"}'
+  -d '{"name":"Alice","email":"alice@example.com","message":"Hello","captchaAnswer":"12","captchaToken":"..."}'
 ```
 
 ```python
@@ -120,7 +142,7 @@ import requests
 
 requests.post(
     "https://yourdomain.com/api/submit",
-    json={"name": "Alice", "email": "alice@example.com", "message": "Hello"},
+    json={"name": "Alice", "email": "alice@example.com", "message": "Hello", "captchaAnswer": "12", "captchaToken": "..."},
     headers={"Referer": "https://yourdomain.com/contact"},
     timeout=10,
 ).raise_for_status()
@@ -128,10 +150,11 @@ requests.post(
 
 ## Checklist for a working integration
 
-1. The submitting page/script's domain is a key in `DOMAIN_EMAIL_MAP`.
-2. Browser forms are served from an origin listed in `CORS_ORIGINS`.
-3. Server-side callers set a `Referer` header on a configured domain.
-4. Body is a JSON object with one or more scalar fields, within the limits
+1. The submitting page/script's exact hostname is a key in `DOMAIN_CONFIG`.
+2. Its `captcha_secret` equals the website's `CAPTCHA_SECRET`.
+3. Browser forms are served from an origin listed in `CORS_ORIGINS`.
+4. Server-side callers set a `Referer` header on a configured domain.
+5. Body is a JSON object with one or more scalar fields, within the limits
    above (include `email` if you want replies to reach the sender).
-5. The public reverse proxy forwards to `127.0.0.1:8004`.
+6. The public reverse proxy forwards to `127.0.0.1:8004`.
 ```
