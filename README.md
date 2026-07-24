@@ -29,6 +29,10 @@ recipients, CAPTCHA secret, and optional SMTP overrides:
     "recipients": ["you@yourdomain.com"],
     "captcha_secret": "at-least-32-random-characters-long",
     "smtp": {
+      "server": "smtp.yourdomain.com",
+      "port": 465,
+      "use_tls": false,
+      "use_ssl": true,
       "username": "website@yourdomain.com",
       "password": "secret",
       "default_sender": "Website <website@yourdomain.com>"
@@ -36,6 +40,23 @@ recipients, CAPTCHA secret, and optional SMTP overrides:
   }
 }
 ```
+
+Every key in `smtp` is optional and falls back to the matching `MAIL_*` default:
+
+| Key | Falls back to | Default | Notes |
+| --- | --- | --- | --- |
+| `server` | `MAIL_SERVER` | - | Required, per domain or shared |
+| `port` | `MAIL_PORT` | `587` | Number or numeric string |
+| `use_tls` | `MAIL_USE_TLS` | `true` | STARTTLS on a plain connection (587) |
+| `use_ssl` | `MAIL_USE_SSL` | `false` | Implicit TLS from the start (465) |
+| `username` | `MAIL_USERNAME` | - | Omit together with `password` for an unauthenticated relay |
+| `password` | `MAIL_PASSWORD` | - | Omit together with `username` |
+| `default_sender` | `MAIL_DEFAULT_SENDER` | - | Required, per domain or shared; used as `From` |
+
+`use_tls` and `use_ssl` are mutually exclusive. Setting either one in a domain's
+`smtp` block selects the transport for that domain outright - the other mode
+defaults to `false` instead of being inherited, so a domain on port 465 only
+needs `"use_ssl": true`.
 
 The CAPTCHA secret must be identical to `CAPTCHA_SECRET` on the corresponding
 Astro website. For compatibility, the old `DOMAIN_EMAIL_MAP` format still works
@@ -58,8 +79,17 @@ third-country recipient. Keep it that way when adding new alerts.
 docker compose up -d --build
 ```
 
-The container runs under gunicorn as a non-root user, exposes port `8004`, and
-ships a `/health` endpoint used by the Docker healthcheck.
+The container runs under gunicorn as a non-root user (uid `10001`), exposes port
+`8004`, and ships a `/health` endpoint used by the Docker healthcheck.
+
+`./data` is bind-mounted into the container, so it must be writable by uid
+`10001`. A short-lived `init_data` service takes care of that on every
+`docker compose up`; if you run the app without compose, chown the directory
+yourself:
+
+```bash
+sudo chown -R 10001:10001 ./data
+```
 
 ## API
 

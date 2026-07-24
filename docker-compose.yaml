@@ -1,9 +1,22 @@
 services:
+  # The bind mount below shadows the image's data directory, so its ownership
+  # comes from the host and rarely matches the container's uid. Fix it up before
+  # the app starts, otherwise SQLite fails with "unable to open database file".
+  init_data:
+    image: busybox
+    user: root
+    command: chown -R 10001:10001 /data
+    volumes:
+      - ./data:/data
+
   flask_app:
     build: .
     image: pythonmailservice
     container_name: pythonmailservice
     restart: unless-stopped
+    depends_on:
+      init_data:
+        condition: service_completed_successfully
     env_file:
       - .env
     ports:

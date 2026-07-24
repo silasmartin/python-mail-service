@@ -39,11 +39,14 @@ Two field names get special handling **when present** (both optional):
 
 - `email` — used as the email `Reply-To` so you can reply straight to the
   sender. If present it must be a valid address.
-- `name` — used in the email subject (`Message from <name>`). Falls back to a
-  generic subject when absent.
+- `name` — used in the email subject (`Neue Kontaktanfrage von <name>`). Falls
+  back to `Neue Kontaktanfrage über <domain>` when absent.
 
-Both are rendered in the body as `Name:` / `Email:`; every other field keeps the
-exact label you submitted it under.
+The notification email is German. `name`, `email` and `message` are rendered as
+`Name:` / `E-Mail:` / `Nachricht:`; every other field keeps the label you
+submitted it under, with its first letter capitalised. Fields containing line
+breaks get their own indented block so the sender's formatting survives, and the
+mail is timestamped in Europe/Berlin.
 
 One further field name is reserved:
 

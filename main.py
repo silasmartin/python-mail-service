@@ -5,6 +5,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from captcha import verify_and_consume_captcha
 from config import load_domain_config
@@ -35,9 +36,13 @@ MAX_EMAIL_LEN = 320
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # 'name' and 'email' carry meaning for the service, so their keys are fixed and
-# lowercase. Every other field is rendered under the label the form submitted,
-# so only these two need a presentable form in the email body.
-DISPLAY_LABELS = {"name": "Name", "email": "Email"}
+# lowercase; 'message' is the conventional body field. Every other field is
+# rendered under the label the form submitted, capitalised for readability.
+DISPLAY_LABELS = {"name": "Name", "email": "E-Mail", "message": "Nachricht"}
+
+# The notification is read by the site operator, so it is German throughout.
+MAIL_TZ = ZoneInfo("Europe/Berlin")
+SEPARATOR = "-" * 52
 
 
 def create_app():
@@ -126,6 +131,57 @@ def _buffer_failed_submission(data_dir, subject, body, recipients):
     return name
 
 
+def render_subject(name, domain):
+    """Build the German subject line for a submission."""
+    return f"Neue Kontaktanfrage von {name}" if name else f"Neue Kontaktanfrage über {domain}"
+
+
+def render_body(fields, domain, reply_to, now=None):
+    """Render the submission as a plain-text German notification email.
+
+    Single-line answers are listed with aligned labels; anything with line
+    breaks (typically the message) gets its own indented block so the original
+    formatting survives.
+    """
+    entries = [
+        (DISPLAY_LABELS.get(key, key[:1].upper() + key[1:]), value)
+        for key, value in fields.items()
+        if value
+    ]
+    received = (now or datetime.now(MAIL_TZ)).astimezone(MAIL_TZ)
+
+    lines = [
+        f"Neue Kontaktanfrage über {domain}",
+        f"Eingegangen am {received:%d.%m.%Y} um {received:%H:%M} Uhr",
+        "",
+        SEPARATOR,
+        "",
+    ]
+
+    single_line = [(label, value) for label, value in entries if "\n" not in value]
+    width = max((len(label) for label, _ in single_line), default=0) + 2
+    for label, value in single_line:
+        lines.append(f"{label + ':':<{width}}{value}")
+
+    for label, value in entries:
+        if "\n" in value:
+            lines.extend(["", f"{label}:"])
+            lines.extend(f"  {line}".rstrip() for line in value.splitlines())
+
+    lines.extend(["", SEPARATOR, ""])
+    if reply_to:
+        lines.append(
+            "Eine Antwort auf diese E-Mail geht direkt an den Absender der Anfrage."
+        )
+    else:
+        lines.append(
+            "Diese Anfrage enthält keine Absenderadresse - eine Antwort per "
+            "E-Mail ist nicht möglich."
+        )
+
+    return "\n".join(lines) + "\n"
+
+
 def _validate_payload(data):
     """Validate a variable form submission.
 
@@ -212,27 +268,8 @@ def register_routes(app):
         name = fields.get("name")
         email = fields.get("email")
 
-        field_lines = "\n".join(
-            f"{DISPLAY_LABELS.get(key, key)}: {value}"
-            for key, value in fields.items()
-            if value
-        )
-        reply_note = (
-            "Eine Antwort auf diese Benachrichtigung wird als Antwort an den Absender der Anfrage geschickt.\n\n"
-            if email
-            else ""
-        )
-        mailmessage = (
-            "Neue Anfrage über das Kontaktformular:\n\n"
-            f"{field_lines}\n\n"
-            f"{reply_note}"
-        )
-
-        subject = (
-            f"Message from {name}"
-            if name
-            else "Neue Nachricht über dein Kontaktformular"
-        )
+        subject = render_subject(name, domain_settings.domain)
+        mailmessage = render_body(fields, domain_settings.domain, email)
 
         threading.Thread(
             target=send_email_in_background,

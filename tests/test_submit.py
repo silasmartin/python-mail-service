@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -180,6 +181,61 @@ class SubmitTests(unittest.TestCase):
             "smtp is down",
         ):
             self.assertNotIn(personal, text)
+
+
+class MailRenderingTests(unittest.TestCase):
+    """The notification is read by the operator, so it must stay German."""
+
+    FIELDS = {
+        "name": "Max Mustermann",
+        "email": "max@example.com",
+        "telefon": "+49 170 1234567",
+        "message": "Guten Tag,\n\nbitte um Rueckruf.",
+    }
+
+    def test_subject_is_german_with_and_without_a_name(self):
+        self.assertEqual(
+            main.render_subject("Max Mustermann", "example.com"),
+            "Neue Kontaktanfrage von Max Mustermann",
+        )
+        self.assertEqual(
+            main.render_subject(None, "example.com"),
+            "Neue Kontaktanfrage über example.com",
+        )
+
+    def test_body_lists_fields_with_german_labels_and_berlin_timestamp(self):
+        # 12:30 UTC is 14:30 in Berlin summer time.
+        now = datetime(2026, 7, 24, 12, 30, tzinfo=timezone.utc)
+        body = main.render_body(self.FIELDS, "example.com", "max@example.com", now=now)
+
+        self.assertIn("Neue Kontaktanfrage über example.com", body)
+        self.assertIn("Eingegangen am 24.07.2026 um 14:30 Uhr", body)
+        self.assertIn("Name:", body)
+        self.assertIn("E-Mail:", body)
+        # Unmapped field names are capitalised, not passed through raw.
+        self.assertIn("Telefon:", body)
+        self.assertIn(
+            "Eine Antwort auf diese E-Mail geht direkt an den Absender der Anfrage.",
+            body,
+        )
+
+    def test_multiline_field_keeps_its_line_breaks_in_an_indented_block(self):
+        body = main.render_body(self.FIELDS, "example.com", "max@example.com")
+
+        self.assertIn("Nachricht:\n  Guten Tag,\n\n  bitte um Rueckruf.", body)
+
+    def test_body_without_reply_address_says_so(self):
+        body = main.render_body({"anliegen": "Rueckruf"}, "example.com", None)
+
+        self.assertIn("Anliegen:", body)
+        self.assertIn("keine Absenderadresse", body)
+
+    def test_empty_fields_are_omitted(self):
+        body = main.render_body(
+            {"name": "Max", "telefon": ""}, "example.com", None
+        )
+
+        self.assertNotIn("Telefon", body)
 
 
 if __name__ == "__main__":

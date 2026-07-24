@@ -81,8 +81,14 @@ def _parse_smtp(domain: str, overrides: object, defaults: dict) -> SmtpSettings:
     if not 1 <= port <= 65535:
         raise RuntimeError(f"Invalid SMTP port for {domain}")
 
-    use_tls = values.get("use_tls", True)
-    use_ssl = values.get("use_ssl", False)
+    # A domain that switches transport names only the mode it wants; inheriting
+    # the shared default for the other mode would raise a bogus TLS+SSL conflict.
+    if "use_tls" in overrides or "use_ssl" in overrides:
+        use_tls = overrides.get("use_tls", False)
+        use_ssl = overrides.get("use_ssl", False)
+    else:
+        use_tls = values.get("use_tls", True)
+        use_ssl = values.get("use_ssl", False)
     if not isinstance(use_tls, bool) or not isinstance(use_ssl, bool):
         raise RuntimeError(f"SMTP use_tls/use_ssl values for {domain} must be booleans")
     if use_tls and use_ssl:
