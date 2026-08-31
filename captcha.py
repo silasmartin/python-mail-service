@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import time
 from contextlib import closing
@@ -9,10 +10,69 @@ from contextlib import closing
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# A challenge is valid for ten minutes. Long enough to write a message, short
+# enough that a harvested token is worthless. Must stay in sync with the Astro
+# implementation, which uses the same window.
+CAPTCHA_LIFETIME_MS = 10 * 60 * 1000
+
+# Single-digit operands keep the task solvable by anyone, including someone
+# using a screen reader. The token is what provides the security, not the
+# difficulty of the sum: it is encrypted, single-use and expires.
+_MIN_OPERAND = 1
+_MAX_OPERAND = 9
+
 
 def _decode_base64url(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(value + padding)
+
+
+def _encode_base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _key_from_secret(secret: str) -> bytes:
+    return hashlib.sha256(secret.encode("utf-8")).digest()
+
+
+def create_captcha(secret: str, *, now_ms: int | None = None) -> dict[str, str]:
+    """Build an arithmetic challenge and an encrypted token carrying its answer.
+
+    The token is AES-256-GCM over ``{answer, expires, nonce}`` under a key
+    derived from the domain's secret, so the server keeps no state until the
+    token is redeemed. Byte-for-byte the same format that the Astro
+    implementation produces, so a site may generate challenges itself or fetch
+    them here - both verify against the same secret.
+    """
+    if not isinstance(secret, str) or len(secret) < 32:
+        raise ValueError("CAPTCHA secret must contain at least 32 characters")
+
+    a = secrets.randbelow(_MAX_OPERAND - _MIN_OPERAND + 1) + _MIN_OPERAND
+    b = secrets.randbelow(_MAX_OPERAND - _MIN_OPERAND + 1) + _MIN_OPERAND
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+
+    payload = json.dumps(
+        {
+            "answer": a + b,
+            "expires": now + CAPTCHA_LIFETIME_MS,
+            "nonce": _encode_base64url(secrets.token_bytes(12)),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    iv = secrets.token_bytes(12)
+    encrypted_and_tag = AESGCM(_key_from_secret(secret)).encrypt(iv, payload, None)
+
+    return {
+        "question": f"{a} + {b} =",
+        "token": ".".join(
+            (
+                _encode_base64url(iv),
+                _encode_base64url(encrypted_and_tag[:-16]),
+                _encode_base64url(encrypted_and_tag[-16:]),
+            )
+        ),
+    }
 
 
 def _consume_token(data_dir: str, token: str, expires: int, now: int) -> bool:
@@ -58,7 +118,7 @@ def verify_and_consume_captcha(
 
     try:
         iv, encrypted, auth_tag = map(_decode_base64url, parts)
-        key = hashlib.sha256(secret.encode("utf-8")).digest()
+        key = _key_from_secret(secret)
         payload = json.loads(AESGCM(key).decrypt(iv, encrypted + auth_tag, None))
     except (InvalidTag, ValueError, TypeError, json.JSONDecodeError):
         return False

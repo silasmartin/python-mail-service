@@ -66,6 +66,31 @@ ten minutes.
 answer is correct, so a `422` means the client must fetch a *new* challenge —
 resubmitting the same token, even with the right answer, will fail again.
 
+### Getting a challenge
+
+Two ways, both producing the same token format and both verified identically:
+
+- **The site signs its own.** A server-rendered site that holds the same
+  `CAPTCHA_SECRET` builds the token itself. Nothing else is needed; this is how
+  the existing integrations work and none of them have to change.
+- **`GET /api/captcha` on this service.** For a statically built site, which has
+  no server of its own to sign anything. The endpoint is optional; it exists
+  only for this case.
+
+```http
+GET /api/captcha
+Origin: https://yourdomain.com
+```
+
+```json
+{ "question": "3 + 7 =", "token": "<iv>.<ct>.<tag>" }
+```
+
+The calling hostname must be a key in `DOMAIN_CONFIG`, exactly as for `/submit`;
+an unknown domain gets `403`. The response carries `Cache-Control: no-store` —
+a cached challenge would be handed to several visitors and burnt by the first
+submission. Fetch a fresh one when the form loads, and again after every `422`.
+
 Constraints (enforced server-side — violating them returns `400`):
 
 | Rule                                                              |
@@ -154,8 +179,12 @@ requests.post(
 ## Checklist for a working integration
 
 1. The submitting page/script's exact hostname is a key in `DOMAIN_CONFIG`.
-2. Its `captcha_secret` equals the website's `CAPTCHA_SECRET`.
-3. Browser forms are served from an origin listed in `CORS_ORIGINS`.
+2. Its `captcha_secret` equals the website's `CAPTCHA_SECRET` — or, for a static
+   site fetching challenges from `GET /api/captcha`, the site needs no secret at
+   all and only this service holds it.
+3. Browser forms are served from an origin listed in `CORS_ORIGINS` (this
+   covers `/api/captcha` as well as `/submit`; same-origin proxying needs no
+   CORS at all).
 4. Server-side callers set a `Referer` header on a configured domain.
 5. Body is a JSON object with one or more scalar fields, within the limits
    above (include `email` if you want replies to reach the sender).

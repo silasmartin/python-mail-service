@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from captcha import verify_and_consume_captcha
+from captcha import create_captcha, verify_and_consume_captcha
 from config import load_domain_config
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -61,8 +61,16 @@ def create_app():
     app.config["DATA_DIR"] = os.getenv("DATA_DIR", "/usr/src/app/data")
 
     # Restrict CORS to the configured origins (comma-separated). Defaults to none.
+    # /api/captcha is listed too: a site that fetches its challenge here does so
+    # from the browser, so it needs the same origin allowance as /submit.
     origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
-    CORS(app, resources={r"/submit": {"origins": origins or []}})
+    CORS(
+        app,
+        resources={
+            r"/submit": {"origins": origins or []},
+            r"/api/captcha": {"origins": origins or []},
+        },
+    )
 
     register_routes(app)
     return app
@@ -232,6 +240,37 @@ def register_routes(app):
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok"}), 200
+
+    @app.route("/api/captcha", methods=["GET"])
+    def captcha():
+        """Hand out a fresh challenge for the calling domain.
+
+        Optional and purely additive: a site that generates its own challenge
+        (an SSR app holding the same secret) never calls this and is unaffected.
+        A static site, which has no server of its own to sign a token, fetches
+        it here instead. Either way /submit verifies against the same secret.
+        """
+        domain_settings = get_domain_settings(
+            app.config["DOMAIN_CONFIG"],
+            request.headers.get("Origin"),
+            request.headers.get("Referer"),
+        )
+        if domain_settings is None:
+            return jsonify({"error": "Unauthorized domain"}), 403
+
+        try:
+            challenge = create_captcha(domain_settings.captcha_secret)
+        except Exception:  # noqa: BLE001 - never leak key material in the response
+            logger.exception("Could not create CAPTCHA for %s", domain_settings.domain)
+            return (
+                jsonify({"error": "Captcha is temporarily unavailable."}),
+                503,
+                {"Cache-Control": "no-store"},
+            )
+
+        # Every visitor must get their own challenge - a cached one would be
+        # replayable and is burnt after the first submission anyway.
+        return jsonify(challenge), 200, {"Cache-Control": "no-store"}
 
     @app.route("/submit", methods=["POST"])
     def submit():

@@ -62,6 +62,26 @@ The CAPTCHA secret must be identical to `CAPTCHA_SECRET` on the corresponding
 Astro website. For compatibility, the old `DOMAIN_EMAIL_MAP` format still works
 with global `MAIL_*` settings and a global `CAPTCHA_SECRET`.
 
+### Where the challenge comes from
+
+A submission carries a `captchaToken` - an encrypted, single-use token holding
+the answer to a small arithmetic question. There are two ways for a site to get
+one, and both verify identically at `/submit`:
+
+| The site is | It gets its challenge from | Needs the secret? |
+| --- | --- | --- |
+| Server-rendered (Astro SSR, its own Node process) | its own `/api/captcha` route, using `CAPTCHA_SECRET` | yes, in the site's own environment |
+| Statically built (plain HTML behind nginx) | `GET /api/captcha` **on this service** | no, only this service holds it |
+
+The endpoint here is **optional and purely additive**. A site that signs its own
+tokens never calls it and is unaffected - nothing about `/submit` changed when
+it was added. A static site has no server of its own to sign a token, so it
+fetches one here instead.
+
+Not holding the secret is the better position for a static site: the secret
+exists in one place instead of two, and a static build cannot leak it into the
+published HTML.
+
 ## Operational alerts
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to be notified when the service
@@ -99,6 +119,11 @@ sudo chown -R 10001:10001 ./data
   Returns `200` on success, `400` for invalid input, `403` for an unauthorized
   domain, or `422` for an invalid CAPTCHA.
   See [docs/SUBMITTING.md](docs/SUBMITTING.md) for the full contract.
+- `GET /api/captcha` — returns `{"question": "3 + 7 =", "token": "<iv>.<ct>.<tag>"}`
+  for the calling domain, signed with that domain's secret. Sent with
+  `Cache-Control: no-store`; every visitor must get their own challenge. Returns
+  `403` for an unauthorized domain or `503` if the challenge cannot be built.
+  Optional - only static sites need it.
 - `GET /health` — liveness probe, returns `{"status": "ok"}`.
 
 ## Local development
@@ -106,4 +131,10 @@ sudo chown -R 10001:10001 ./data
 ```bash
 pip install -r requirements.txt
 python main.py   # dev server on 127.0.0.1:8004
+```
+
+Run the tests from the repository root:
+
+```bash
+PYTHONPATH=. python -m unittest discover -s tests -p "test_*.py" -t tests
 ```
